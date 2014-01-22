@@ -14,7 +14,7 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
         $this->output = $this->getMock('\ezcConsoleOutput');
         $this->input = $this->getMock('\ezcConsoleInput');
 
-        $this->shell = $this->getMock('\Fresque\Fresque', array('callCommand', 'outputTitle', 'kill', 'getUserChoice'));
+        $this->shell = $this->getMock('\Fresque\Fresque', array('callCommand', 'outputTitle', 'kill', 'getUserChoice', 'testConfig'));
         $this->shell->output = $this->output;
         $this->shell->input = $this->input;
 
@@ -44,6 +44,10 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
                 'handler' => '',
                 'target' => '',
                 'filename' => ''
+            ),
+            'Scheduler' => array(
+                'lib' => './vendor/kamisama/phhp-resque-ex-scheduler',
+                'log' => ''
             )
         );
 
@@ -186,7 +190,7 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
     public function testStart()
     {
 
-        $this->shell = $this->getMock('\Fresque\Fresque', array('callCommand', 'outputTitle', 'exec', 'checkStartedWorker'));
+        $this->shell = $this->getMock('\Fresque\Fresque', array('callCommand', 'outputTitle', 'exec', 'checkStartedWorker', 'getProcessOwner'));
         $this->shell->output = $this->output;
 
         $this->shell->expects($this->never())->method('outputTitle');
@@ -212,6 +216,46 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
         $this->shell->ResqueStatus = $this->ResqueStatus;
 
         $this->shell->start($this->startArgs);
+    }
+
+    /**
+     * Start a scheduler worker
+     *
+     * @covers \Fresque\Fresque::startScheduler
+     * @return void
+     */
+    public function testStartScheduler() {
+        $this->shell = $this->getMock('\Fresque\Fresque', array('callCommand', 'outputTitle', 'exec', 'checkStartedWorker', 'getProcessOwner'));
+        $this->shell->output = $this->output;
+
+        $pid = rand(0, 100);
+
+        $this->shell->expects($this->never())->method('outputTitle');
+
+        $this->shell->expects($this->once())->method('exec')->will($this->returnValue(true));
+        $this->shell->expects($this->once())->method('checkStartedWorker')->will($this->returnValue(true));
+
+        $this->output->expects($this->at(0))->method('outputText')->with($this->stringContains('Starting scheduler worker'));
+        $this->output->expects($this->at(1))->method('outputText')->with($this->stringContains('.'));
+        $this->output->expects($this->at(2))->method('outputText')->with($this->stringContains('.'));
+        $this->output->expects($this->at(3))->method('outputText')->with($this->stringContains('.'));
+        $this->output->expects($this->at(4))->method('outputLine')->with($this->stringContains('done'));
+        $this->output->expects($this->exactly(1))->method('outputLine');
+        $this->output->expects($this->exactly(4))->method('outputText');
+
+        $this->ResqueStatus = $this->getMock(
+            'ResqueStatus\ResqueStatus',
+            array('isRunningSchedulerWorker', 'registerSchedulerWorker', 'addWorker'),
+            array(new \stdClass())
+        );
+
+        $this->ResqueStatus->expects($this->once())->method('isRunningSchedulerWorker')->will($this->returnValue(false));
+        $this->ResqueStatus->expects($this->once())->method('registerSchedulerWorker')->with($this->equalTo($pid));
+        $this->ResqueStatus->expects($this->once())->method('addWorker');
+        $this->shell->ResqueStatus = $this->ResqueStatus;
+
+        $this->startArgs['Scheduler']['enabled'] = true;
+        $this->shell->start($this->startArgs, true);
     }
 
     public function testRestartWhenNoStartedWorkers()
@@ -250,6 +294,9 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
         $this->shell->restart();
     }
 
+    /**
+     * Load should returns an error message when there is nothing to load
+     */
     public function testLoadWhenNothingToLoad()
     {
         $this->shell = $this->getMock('\Fresque\Fresque', array('callCommand', 'start', 'stop', 'outputTitle'));
@@ -263,6 +310,8 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
 
         $this->shell->ResqueStatus = $this->ResqueStatus;
         $this->shell->runtime['Queues'] = array();
+        $this->shell->runtime['Scheduler']['enabled'] = false;
+
         $this->shell->load();
     }
 
@@ -286,6 +335,7 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
             'debug' => false
         );
         $this->shell->runtime['Queues'] = array($queue, $queue);
+        $this->shell->runtime['Scheduler']['enabled'] = false;
         $this->shell->load();
     }
 
@@ -818,6 +868,248 @@ class FresqueTest extends \PHPUnit_Framework_TestCase
 
         $this->shell->reset();
     }
+
+    /**
+     * loadSettings is using the default fresque.ini
+     */
+    public function testLoadSettingsUsingDefaultConfigFile()
+    {
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->once())->method('getOption')->will($this->returnValue($option));
+
+        $this->shell->loadSettings('');
+
+        $this->assertEquals('./fresque.ini', $this->shell->config);
+    }
+
+    /**
+     * loadSettings should die if .ini file does not exists
+     * Setting from $args argument
+     */
+    public function testLoadSettingsUsingInexistingConfigFileFromArgs()
+    {
+        $iniFile = 'inexisting_file.ini';
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->never())->method('getOptionValues');
+        $this->input->expects($this->never())->method('getOption');
+        $this->output->expects($this->once())->method('outputLine')->with($this->stringContains('The config file \'' . $iniFile . '\' was not found'));
+
+        $return = $this->shell->loadSettings('', array('config' => $iniFile));
+
+        $this->assertEquals($iniFile, $this->shell->config);
+        $this->assertEquals(false, $return);
+    }
+
+    /**
+     * loadSettings should die if .ini file does not exists
+     * Setting from cli option
+     */
+    public function testLoadSettingsUsingInexistingConfigFileFromOption()
+    {
+        $iniFile = 'inexisting_file.ini';
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->once())->method('getOptionValues')->will(
+            $this->returnValue(array('config' => $iniFile))
+        );
+        $this->input->expects($this->never())->method('getOption');
+        $this->output->expects($this->once())->method('outputLine')->with($this->stringContains('The config file \'' . $iniFile . '\' was not found'));
+
+        $return = $this->shell->loadSettings('');
+
+        $this->assertEquals($iniFile, $this->shell->config);
+        $this->assertEquals(false, $return);
+    }
+
+    /**
+     * loadSettings is using debug false by default
+     */
+    public function testLoadSettingsWithDebugToFalse()
+    {
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->once())->method('getOptionValues');
+        $this->input->expects($this->once())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+
+        $return = $this->shell->loadSettings('');
+
+        $this->assertEquals(false, $this->shell->debug);
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings is using debug setting from arguments
+     */
+    public function testLoadSettingsWithDebugFromArgs()
+    {
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->never())->method('getOptionValues');
+        $this->input->expects($this->once())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+
+        $return = $this->shell->loadSettings('', array('debug' => true));
+
+        $this->assertEquals(true, $this->shell->debug);
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings is using debug setting from arguments
+     */
+    public function testLoadSettingsWithDebugFromOption()
+    {
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->once())->method('getOptionValues')->will($this->returnValue(array(
+            'debug' => true
+        )));
+        $this->input->expects($this->once())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+
+        $return = $this->shell->loadSettings('');
+
+        $this->assertEquals(true, $this->shell->debug);
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings is using default verbose from .ini file
+     */
+    public function testLoadSettingsWithDefaultVerbose()
+    {
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->once())->method('getOptionValues');
+        $this->input->expects($this->once())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+
+        $return = $this->shell->loadSettings('');
+
+        $this->assertEquals(false, $this->shell->runtime['Default']['verbose']);
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings is using verbose from cli option
+     */
+    public function testLoadSettingsWithVerboseFromOption()
+    {
+        $option = new \stdClass();
+        $option->value = true;
+        $this->input->expects($this->never())->method('getOptionValues');
+        $this->input->expects($this->any())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+
+        $return = $this->shell->loadSettings('', array('verbose' => false));
+
+        $this->assertEquals(true, $this->shell->runtime['Default']['verbose']);
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings call testConfig when not a test command
+     */
+    public function testLoadSettingCallForTestConfig()
+    {
+        $testResults = array(
+            'name1' => true,
+            'name2' => true
+        );
+
+        $option = new \stdClass();
+        $option->value = true;
+        $this->input->expects($this->once())->method('getOptionValues');
+        $this->input->expects($this->any())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+        $this->shell->expects($this->once())->method('testConfig')->will($this->returnValue($testResults));
+
+        $return = $this->shell->loadSettings('');
+
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings call testConfig when not a test command
+     */
+    public function testLoadSettingDoNotCallForTestConfigOnTestCommand()
+    {
+        $option = new \stdClass();
+        $option->value = true;
+        $this->input->expects($this->once())->method('getOptionValues');
+        $this->input->expects($this->any())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+        $this->shell->expects($this->never())->method('testConfig');
+
+        $return = $this->shell->loadSettings('test');
+
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings die when settings contains errors
+     */
+    public function testLoadSettingsDieWhenConfigContainsError()
+    {
+        $errors = array(
+            'name1' => 'message1',
+            'name2' => 'message2'
+        );
+
+        $option = new \stdClass();
+        $option->value = true;
+        $this->input->expects($this->once())->method('getOptionValues');
+        $this->input->expects($this->any())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+        $this->shell->expects($this->once())->method('testConfig')->will($this->returnValue($errors));
+        $this->output->expects($this->at(0))->method('outputLine')->with($this->equalTo($errors['name1']));
+        $this->output->expects($this->at(1))->method('outputLine')->with($this->equalTo($errors['name2']));
+        $this->output->expects($this->at(2))->method('outputLine')->with();
+
+        $return = $this->shell->loadSettings('');
+
+        $this->assertEquals(false, $return);
+    }
+
+    /**
+     * loadSettings will override .ini file settings with cli option
+     */
+    public function testLoadSettingsOverrideDefaultSettingsWithCLIOption()
+    {
+        $cliOption = array('host' => 'testhost', 'include' => 'custom.php');
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->once())->method('getOptionValues')->will($this->returnValue($cliOption));
+        $this->input->expects($this->once())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+
+        $return = $this->shell->loadSettings('');
+
+        // New settings from CLI
+        $this->assertEquals($cliOption['host'], $this->shell->runtime['Redis']['host']);
+        $this->assertEquals($cliOption['include'], $this->shell->runtime['Fresque']['include']);
+
+        // Other settings did not change
+        $this->assertEquals(6379, $this->shell->runtime['Redis']['port']);
+
+        $this->assertEquals(true, $return);
+    }
+
+    /**
+     * loadSettings setup Queues for load command
+     */
+    public function testLoadSettingsSetupQueuesForLoadCommand()
+    {
+        $option = new \stdClass();
+        $option->value = false;
+        $this->input->expects($this->once())->method('getOptionValues')->will($this->returnValue(array('config' => __DIR__ . DS . 'test_fresque.ini')));
+        $this->input->expects($this->once())->method('getOption')->with($this->equalTo('verbose'))->will($this->returnValue($option));
+
+        $return = $this->shell->loadSettings('');
+
+        $config = parse_ini_file(__DIR__ . DS . 'test_fresque.ini', true);
+
+        $config['Queues']['activity']['queue'] = 'activity';
+
+        $this->assertEquals($config['Queues'], $this->shell->runtime['Queues']);
+        $this->assertEquals(true, $return);
+    }
+
+
 }
 
 

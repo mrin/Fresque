@@ -49,7 +49,7 @@ class Fresque
 
     public static $checkStartedWorkerBufferTime = 100000;
 
-    const VERSION = '1.2.0';
+    const VERSION = '1.3.0';
 
     public function __construct()
     {
@@ -281,6 +281,9 @@ class Fresque
                     'help' => 'Start a new worker',
                     'options' => array('u' => 'username', 'q' => 'queue name',
                             'i' => 'num', 'n' => 'num', 'l' => 'path', 'v', 'g')),
+            'startScheduler' => array(
+                    'help' => 'Start the scheduler worker',
+                    'options' => array('i' => 'num')),
             'stop' => array(
                     'help' => 'Stop workers',
                     'options' => array('f', 'w', 'g')),
@@ -327,7 +330,9 @@ class Fresque
      */
     public function callCommand($command)
     {
-        $settings = $this->loadSettings($command);
+        if (($settings = $this->loadSettings($command)) === false) {
+            exit(1);
+        }
 
         $args = $this->input->getArguments();
 
@@ -398,11 +403,28 @@ class Fresque
                     )
                 );
 
+
+                if ($this->runtime['Scheduler']['enabled'] === true) {
+                    require_once realpath($this->runtime['Scheduler']['lib'] . DS . 'lib' . DS . 'ResqueScheduler' . DS . 'ResqueScheduler.php');
+                    require_once realpath($this->runtime['Scheduler']['lib'] . DS . 'lib' . DS . 'ResqueScheduler' . DS . 'Stat.php');
+                }
+
                 $this->ResqueStatus = new \ResqueStatus\ResqueStatus(\Resque::Redis());
                 $this->ResqueStats = new ResqueStats(\Resque::Redis());
                 $this->{$command}();
             }
         }
+    }
+
+    /**
+     * Start the scheduler worker
+     *
+     * @param array $args If present, start the worker with these args.
+     * @return bool True if the scheduler was created
+     * @since 1.3.0
+     */
+    public function startScheduler($args = null) {
+        return $this->start($args, true);
     }
 
 
@@ -411,28 +433,52 @@ class Fresque
      *
      * @return  void
      */
-    public function start($args = null)
+    public function start($args = null, $scheduler = false)
     {
         if ($args === null) {
-            $this->outputTitle('Creating workers');
+            $this->outputTitle($scheduler ? 'Creating the scheduler worker' : 'Creating workers');
         } else {
             $this->runtime = $args;
         }
 
-        $pidFile = dirname(__DIR__) . DS . 'tmp' . DS . str_replace('.', '', microtime(true));
+        if ($scheduler) {
+            if ($this->runtime['Scheduler']['enabled'] !== true) {
+                $this->output->outputLine('Scheduler Worker is not enabled', 'failure');
+                return false;
+            }
+
+            if ($this->ResqueStatus->isRunningSchedulerWorker()) {
+                $this->output->outputLine('The scheduler worker is already running', 'warning');
+                return false;
+            }
+
+            $args['type'] = 'scheduler';
+        }
+
+
+        $pidFile = (isset($this->runtime['Fresque']['tmpdir']) ?
+                        $this->runtime['Fresque']['tmpdir'] : dirname(__DIR__) . DS . 'tmp' )
+                        . DS . str_replace('.', '', microtime(true));
         $count = $this->runtime['Default']['workers'];
 
         $this->debug('Will start ' . $count . ' workers');
 
         for ($i = 1; $i <= $count; $i++) {
 
-            $cmd = 'nohup sudo -u '. escapeshellarg($this->runtime['Default']['user']) . " \\\n".
+            $libraryPath = $scheduler ? $this->runtime['Scheduler']['lib'] : $this->runtime['Fresque']['lib'];
+            $logFile = $scheduler ? $this->runtime['Scheduler']['log'] : $this->runtime['Log']['filename'];
+            $resqueBin = $scheduler ? './bin/resque-scheduler.php' : $this->getResqueBinFile($this->runtime['Fresque']['lib']);
+
+            $libraryPath = rtrim($libraryPath, '/');
+
+            $cmd = 'nohup ' . ($this->runtime['Default']['user'] !== $this->getProcessOwner() ? ('sudo -u '. escapeshellarg($this->runtime['Default']['user'])) : "") . " \\\n".
             'bash -c "cd ' .
-            escapeshellarg($this->runtime['Fresque']['lib']) . '; ' . " \\\n".
+            escapeshellarg($libraryPath) . '; ' . " \\\n".
             (($this->runtime['Default']['verbose']) ? 'VVERBOSE' : 'VERBOSE') . '=true ' . " \\\n".
             'QUEUE=' . escapeshellarg($this->runtime['Default']['queue']) . " \\\n".
             'PIDFILE=' . escapeshellarg($pidFile) . " \\\n".
             'APP_INCLUDE=' . escapeshellarg($this->runtime['Fresque']['include']) . " \\\n".
+            'RESQUE_PHP=' . escapeshellarg($this->runtime['Fresque']['lib'] . DS . 'lib' . DS . 'Resque.php') . " \\\n".
             'INTERVAL=' . escapeshellarg($this->runtime['Default']['interval']) . " \\\n".
             'REDIS_BACKEND=' . escapeshellarg($this->runtime['Redis']['host'] . ':' . $this->runtime['Redis']['port']) . " \\\n".
             'REDIS_DATABASE=' . escapeshellarg($this->runtime['Redis']['database']) . " \\\n".
@@ -440,15 +486,15 @@ class Fresque
             'COUNT=' . 1 . " \\\n".
             'LOGHANDLER=' . escapeshellarg($this->runtime['Log']['handler']) . " \\\n".
             'LOGHANDLERTARGET=' . escapeshellarg($this->runtime['Log']['target']) . " \\\n".
-            'php ' . $this->getResqueBinFile($this->runtime['Fresque']['lib']) . " \\\n";
-            $cmd .= ' >> '. escapeshellarg($this->runtime['Log']['filename']).' 2>&1" >/dev/null 2>&1 &';
+            'php ' . escapeshellarg($resqueBin) . " \\\n";
+            $cmd .= ' >> '. escapeshellarg($logFile).' 2>&1" >/dev/null 2>&1 &';
 
             $this->debug('Starting worker (' . $i . ')');
             $this->debug("Running command :\n\t" . str_replace("\n", "\n\t", $cmd));
 
             $this->exec($cmd);
 
-            $this->output->outputText('Starting worker ');
+            $this->output->outputText($scheduler ? 'Starting scheduler worker ' : 'Starting worker ');
 
             $success = false;
             $attempt = 7;
@@ -467,6 +513,9 @@ class Fresque
 
                     $workerSettings = $this->runtime;
                     $workerSettings['workers'] = 1;
+                    if ($scheduler) {
+                        $this->ResqueStatus->registerSchedulerWorker($pid);
+                    }
                     $this->ResqueStatus->addWorker($pid, $workerSettings);
 
                     break;
@@ -505,6 +554,10 @@ class Fresque
         $options->successCallback = function ($pid, $workerName) use ($ResqueStatus) {
             $ResqueStatus->removeWorker($pid);
         };
+        $options->schedulerWorkerActionMessage = 'Stopping the Scheduler Worker';
+        $options->schedulerWorkerAction = function($worker) use ($ResqueStatus) {
+            $ResqueStatus->unregisterSchedulerWorker();
+        };
 
         $this->sendSignal($options);
     }
@@ -539,6 +592,7 @@ class Fresque
         $options->successCallback = function ($pid, $workerName) use ($ResqueStatus) {
             $ResqueStatus->setPausedWorker($workerName);
         };
+        $options->schedulerWorkerActionMessage = 'Pausing the Scheduler Worker';
 
         $this->sendSignal($options);
     }
@@ -564,6 +618,7 @@ class Fresque
         $options->successCallback = function ($pid, $workerName) use ($ResqueStatus) {
             $ResqueStatus->setPausedWorker($workerName, false);
         };
+        $options->schedulerWorkerActionMessage = 'Resuming the Scheduler Worker';
 
         $this->sendSignal($options);
     }
@@ -592,11 +647,12 @@ class Fresque
 
         if (!isset($options->formatListItem)) {
             $resqueStats = $this->ResqueStats;
+            $ResqueStatus = $this->ResqueStatus;
             $fresque = $this;
-            $listFormatter = function ($worker) use ($resqueStats, $fresque) {
+            $listFormatter = function ($worker) use ($resqueStats, $ResqueStatus, $fresque) {
                 return sprintf(
                     '%s, started %s ago',
-                    $worker,
+                    $ResqueStatus->isSchedulerWorker($worker) ? '**Scheduler Worker**' : $worker,
                     $fresque->formatDateDiff(call_user_func_array(array($resqueStats, 'getWorkerStartDate'), array($worker)))
                 );
             };
@@ -642,7 +698,18 @@ class Fresque
                 list($hostname, $pid, $queue) = explode(':', (string)$worker);
 
                 $this->debug('Sending -' . $options->signal . ' signal to process ID ' . $pid);
-                $this->output->outputText($options->actionMessage . ' ' . $pid . ' ... ');
+
+                if ($this->runtime['Scheduler']['enabled'] === true && $this->ResqueStatus->isSchedulerWorker($worker)) {
+                    if (isset($options->schedulerWorkerAction)) {
+                        $f = $options->schedulerWorkerAction;
+                        $f($worker);
+                    }
+                    $this->output->outputText($options->schedulerWorkerActionMessage . ' ... ');
+                } else {
+                    $this->output->outputText($options->actionMessage . ' ' . $pid . ' ... ');
+                }
+
+
 
                 $killResponse = $this->kill($options->signal, $pid);
                 $options->onSuccess($pid, (string)$worker);
@@ -667,6 +734,7 @@ class Fresque
     public function load()
     {
         $this->outputTitle('Loading predefined workers');
+        $debug = $this->debug;
 
         if (!isset($this->runtime['Queues']) || empty($this->runtime['Queues'])) {
             $this->output->outputLine("You have no configured workers to load.\n", 'failure');
@@ -674,7 +742,6 @@ class Fresque
             $this->output->outputLine(sprintf('Loading %s workers', count($this->runtime['Queues'])));
 
             $config = $this->config;
-            $debug = $this->debug;
 
             foreach ($this->runtime['Queues'] as $queue) {
                 $queue['config'] = $config;
@@ -682,6 +749,10 @@ class Fresque
                 $this->loadSettings('load', $queue);
                 $this->start($this->runtime);
             }
+        }
+
+        if ($this->runtime['Scheduler']['enabled'] === true) {
+            $this->startscheduler(array('debug' => $debug));
         }
 
         $this->output->outputLine();
@@ -703,7 +774,11 @@ class Fresque
             $this->stop();
 
             foreach ($workers as $worker) {
-                $this->start($worker);
+                if (isset($worker['type']) && $worker['type'] === 'scheduler') {
+                    $this->startScheduler($worker);
+                } else {
+                    $this->start($worker);
+                }
             }
         } else {
             $this->output->outputLine('No workers to restart', 'failure');
@@ -822,6 +897,9 @@ class Fresque
         $this->output->outputLine('Jobs Stats', 'subtitle');
         $this->output->outputLine('   ' . sprintf('Processed Jobs : %10s', number_format(\Resque_Stat::get('processed'))));
         $this->output->outputLine('   ' . sprintf('Failed Jobs    : %10s', number_format(\Resque_Stat::get('failed'))), 'failure');
+        if ($this->runtime['Scheduler']['enabled'] === true) {
+            $this->output->outputLine('   ' . sprintf('Scheduled Jobs : %10s', number_format(\ResqueScheduler\Stat::get())));
+        }
         $this->output->outputLine();
 
         $count = array();
@@ -846,11 +924,18 @@ class Fresque
         $this->output->outputLine('Workers Stats', 'subtitle');
         $this->output->outputLine('  Active Workers : ' . count($workers));
 
+        $schedulerWorkers = array();
+
         if (!empty($workers)) {
 
             $pausedWorkers = call_user_func(array($this->ResqueStatus, 'getPausedWorker'));
 
             foreach ($workers as $worker) {
+                if ($this->runtime['Scheduler']['enabled'] === true && $this->ResqueStatus->isSchedulerWorker($worker)) {
+                    $schedulerWorkers[] = $worker;
+                    continue;
+                }
+
                 $this->output->outputText('    Worker : ' . $worker, 'bold');
                 if (in_array((string)$worker, $pausedWorkers)) {
                     $this->output->outputText(' (Paused)', 'success');
@@ -874,6 +959,35 @@ class Fresque
         }
 
         $this->output->outputLine("\n");
+
+        if (!empty($schedulerWorkers)) {
+            $this->output->outputText(ucwords('    scheduler worker'), 'bold');
+            if (in_array((string)$schedulerWorkers[0], $pausedWorkers)) {
+                $this->output->outputText(' (Paused)', 'success');
+            }
+            $this->output->outputText("\n");
+
+            foreach ($schedulerWorkers as $worker) {
+                $schedulerWorker = new \ResqueScheduler\ResqueScheduler();
+                $delayedJobCount = $schedulerWorker->getDelayedQueueScheduleSize();
+                $this->output->outputLine('    - Started on      : ' . call_user_func_array(array($this->ResqueStats, 'getWorkerStartDate'), array($worker)));
+                $this->output->outputLine('    - Delayed Jobs    : ' . number_format($delayedJobCount));
+
+                if ($delayedJobCount > 0) {
+                    $this->output->outputLine('    - Next Job on     : ' . strftime('%a %b %d %H:%M:%S %Z %Y', $schedulerWorker->nextDelayedTimestamp()));
+                }
+            }
+            $this->output->outputLine("\n");
+        } elseif ($this->runtime['Scheduler']['enabled'] === true) {
+            $jobsCount = \ResqueScheduler\ResqueScheduler::getDelayedQueueScheduleSize();
+            if ($jobsCount > 0) {
+                $this->output->outputLine("    ************ " . 'Alert' . " ************", 'failure');
+                $this->output->outputLine("    " . 'The Scheduler Worker is not running', 'bold');
+                $this->output->outputLine("    " . 'But there is still ' . number_format($jobsCount) . ' scheduled jobs left in its queue');
+                $this->output->outputLine("    ********************************", 'failure');
+                $this->output->outputLine("\n");
+            }
+        }
     }
 
     /**
@@ -884,8 +998,11 @@ class Fresque
      */
     public function reset()
     {
+        $this->debug('Emptying the worker database');
         $this->ResqueStatus->clearWorkers();
+        $this->debug('Unregistering the scheduler worker');
         $this->ResqueStatus->unregisterSchedulerWorker();
+        $this->output->outputLine('Fresque state has been reseted', 'success');
     }
 
 
@@ -949,7 +1066,7 @@ class Fresque
 
         $this->runtime['Fresque']['lib'] = $this->absolutePath($this->runtime['Fresque']['lib']);
 
-        if (!is_dir($this->runtime['Fresque']['lib']) || !is_dir($this->runtime['Fresque']['lib'])) {
+        if (!is_dir($this->runtime['Fresque']['lib'])) {
             $results['PHPResque library']
                 = 'Unable to found PHP Resque library. Check that the path is valid, and directory is readable';
         }
@@ -972,7 +1089,6 @@ class Fresque
                 . $this->runtime['Redis']['host'] . ':' . $this->runtime['Redis']['port'];
         }
 
-
         $this->runtime['Log']['filename'] = $this->absolutePath($this->runtime['Log']['filename']);
 
         $logPath = pathinfo($this->runtime['Log']['filename'], PATHINFO_DIRNAME);
@@ -988,26 +1104,6 @@ class Fresque
             $results['user'] = sprintf('User %s does not exists', $this->runtime['Default']['user']);
         }
 
-        $resqueFiles = array(
-                'lib'.DS.'Resque.php',
-                'lib'.DS.'Resque'.DS.'Stat.php',
-                'lib'.DS.'Resque'.DS.'Worker.php'
-        );
-
-
-
-        $found = true;
-        foreach ($resqueFiles as $file) {
-            if (!file_exists($this->runtime['Fresque']['lib'] . DS . $file)) {
-                $found = false;
-                break;
-            }
-        }
-
-        if (!$found) {
-            $results['PHPResque library'] = 'Unable to find PHPResque library';
-        }
-
         $this->runtime['Fresque']['include'] = $this->absolutePath($this->runtime['Fresque']['include']);
         if (!file_exists($this->runtime['Fresque']['include'])) {
             $results['Application autoloader'] = 'Your application autoloader file was not found';
@@ -1020,7 +1116,7 @@ class Fresque
      * Convert options from various source to formatted options
      * understandable by Fresque
      *
-     * @return  void
+     * @return bool true if settings contains no errors
      */
     public function loadSettings($command, $args = null)
     {
@@ -1029,41 +1125,84 @@ class Fresque
         $this->config = isset($options['config']) ? $options['config'] : '.'.DS.'fresque.ini';
         if (!file_exists($this->config)) {
             $this->output->outputLine("The config file '$this->config' was not found", 'failure');
-            die();
+            return false;
         }
 
         $this->debug = isset($options['debug']) ? $options['debug'] : false;
 
         $this->runtime = parse_ini_file($this->config, true);
 
+        if (!isset($this->runtime['type'])) {
+            $this->runtime['type'] = 'regular';
+        }
+
         $settings = array(
-            $this->runtime['Redis']['host'] => 'host',
-            $this->runtime['Redis']['port'] => 'port',
-            $this->runtime['Log']['filename'] => 'log',
-            $this->runtime['Log']['handler'] => 'loghandler',
-            $this->runtime['Log']['target'] => 'handlertarget',
-            $this->runtime['Fresque']['lib'] => 'lib',
-            $this->runtime['Fresque']['include'] => 'autoloader',
-            $this->runtime['Default']['user'] => 'user',
-            $this->runtime['Default']['queue'] => 'queue',
-            $this->runtime['Default']['workers'] => 'workers',
-            $this->runtime['Default']['interval'] => 'interval'
+            'Redis' => array(
+                'host',
+                'port',
+                'database',
+                'namespace',
+            ),
+            'Fresque' => array(
+                'lib',
+                'include',
+            ),
+            'Default' => array(
+                'queue',
+                'interval',
+                'workers',
+                'user',
+                'verbose',
+            ),
+            'Log' => array(
+                'filename',
+                'handler',
+                'target',
+            ),
+            'Scheduler' => array(
+                'enabled',
+                'lib',
+                'log',
+                'interval',
+                'handler',
+                'target'
+            )
         );
 
-        foreach ($settings as $runtime => $option) {
-            if (isset($options[$option])) {
-                $this->runtime['Default'][$option] = $options[$option];
+        foreach ($settings as $scope => $param_names) {
+            foreach ($param_names as $option) {
+                if (isset($options[$option])) {
+                    $this->runtime[$scope][$option] = $options[$option];
+                }
             }
         }
 
         if (isset($this->runtime['Queues']) && !empty($this->runtime['Queues'])) {
             foreach ($this->runtime['Queues'] as $name => $options) {
-                $this->runtime['Queues'][$name]['queue'] = $name;
+               if (!isset($this->runtime['Queues'][$name]['queue'])) {
+                    $this->runtime['Queues'][$name]['queue'] = $name;
+                }
             }
         }
 
         $this->runtime['Default']['verbose'] = ($this->input->getOption('verbose')->value)
             ? $this->input->getOption('verbose')->value : $this->settings['Default']['verbose'];
+
+        $this->runtime['Scheduler']['enabled'] = (bool)$this->runtime['Scheduler']['enabled'];
+
+        if ($this->runtime['Scheduler']['enabled']) {
+            if (!empty($this->runtime['Scheduler']['handler']) && $this->runtime['Scheduler']['type'] === 'scheduler') {
+                $this->runtime['Log']['handler'] = $this->runtime['Scheduler']['handler'];
+            }
+
+            if (!empty($this->runtime['Scheduler']['target']) && $this->runtime['Scheduler']['type'] === 'scheduler') {
+                $this->runtime['Log']['target'] = $this->runtime['Scheduler']['target'];
+            }
+
+            if (!empty($this->runtime['Scheduler']['interval'])) {
+                $this->runtime['Default']['interval'] = $this->runtime['Scheduler']['interval'];
+            }
+        }
 
         // Shutdown application if there is error in the config
         if ($command !== 'test') {
@@ -1080,10 +1219,12 @@ class Fresque
 
                 if ($fail) {
                     $this->output->outputLine();
-                    exit(1);
+                    return false;
                 }
             }
         }
+
+        return true;
     }
 
     /**
@@ -1095,7 +1236,7 @@ class Fresque
     public function help($command = null)
     {
         $this->outputTitle('Welcome to Fresque');
-        $this->output->outputLine('Fresque '. Fresque::VERSION.' by Wan Chen (Kamisama) (2013)');
+        $this->output->outputLine('Fresque '. Fresque::VERSION .' by Wan Chen (Kamisama) (2013)');
 
         if (!array_key_exists($command, $this->commandTree)
             && $command !== null
@@ -1174,31 +1315,31 @@ class Fresque
 
         $format = array();
         if ($interval->y !== 0) {
-            $format[] = '%y '.$doPlural($interval->y, 'year');
+            $format[] = '%y ' . $doPlural($interval->y, 'year');
         }
         if ($interval->m !== 0) {
-            $format[] = '%m '.$doPlural($interval->m, 'month');
+            $format[] = '%m ' . $doPlural($interval->m, 'month');
         }
         if ($interval->d !== 0) {
-            $format[] = '%d '.$doPlural($interval->d, 'day');
+            $format[] = '%d ' . $doPlural($interval->d, 'day');
         }
         if ($interval->h !== 0) {
-            $format[] = '%h '.$doPlural($interval->h, 'hour');
+            $format[] = '%h ' . $doPlural($interval->h, 'hour');
         }
         if ($interval->i !== 0) {
-            $format[] = '%i '.$doPlural($interval->i, 'minute');
+            $format[] = '%i ' . $doPlural($interval->i, 'minute');
         }
         if ($interval->s !== 0) {
             if (!count($format)) {
                 return 'less than a minute';
             } else {
-                $format[] = '%s '.$doPlural($interval->s, 'second');
+                $format[] = '%s ' . $doPlural($interval->s, 'second');
             }
         }
 
         // We use the two biggest parts
         if (count($format) > 1) {
-            $format = array_shift($format).' and '.array_shift($format);
+            $format = array_shift($format) . ' and '.array_shift($format);
         } else {
             $format = array_pop($format);
         }
@@ -1216,9 +1357,9 @@ class Fresque
      */
     private function absolutePath($path)
     {
-        if (substr($path, 0, 2) == './') {
+        if (substr($path, 0, 2) === './') {
             $path = dirname(__DIR__) . DS . substr($path, 2);
-        } elseif (substr($path, 0, 1) !== '/' || substr($path, 0, 3) == '../') {
+        } elseif (substr($path, 0, 1) !== '/' || substr($path, 0, 3) === '../') {
             $path = dirname(__DIR__) . DS . $path;
         }
         return rtrim($path, DS);
@@ -1358,5 +1499,27 @@ class Fresque
         } while ($menuDialog->hasValidResult() === false);
 
         return $menuDialog->getResult();
+    }
+
+/**
+ * Return the user owning the current process
+ *
+ * @codeCoverageIgnore
+ * @since 1.2.4
+ * @return string Username of the current process owner if found, else false
+ */
+    private function getProcessOwner() {
+        if (function_exists('posix_getpwuid')) {
+            $a = posix_getpwuid(posix_getuid());
+            return $a['name'];
+        } else {
+            $user = trim(exec('whoami', $o, $code));
+            if ($code === 0) {
+                return $user;
+            }
+            return false;
+        }
+
+        return false;
     }
 }
